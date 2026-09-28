@@ -73,6 +73,21 @@
 #define SHARC_USE_FP16                          0       // use fp16 for sample weights storage
 #endif
 
+// Development switches (RTXGI variance investigation). The host sets these before including this
+// header -- the RTXGI sample does so through DevSharc.h -- and the defaults keep the library usable
+// standalone.
+#ifndef DEV_SHARC_ENABLE_FIREFLY
+#define DEV_SHARC_ENABLE_FIREFLY                1       // anti-firefly filter in SharcAddVoxelData; 0 compiles it and its parameter out
+#endif
+
+#ifndef DEV_SHARC_ENABLE_HISTOGRAM
+#define DEV_SHARC_ENABLE_HISTOGRAM              0       // record per-path deposit totals for watched voxels (SHARC_UPDATE only)
+#endif
+
+#if DEV_SHARC_ENABLE_HISTOGRAM && !defined(DEV_SHARC_HISTOGRAM_BUFFER_SIZE)
+#error "DEV_SHARC_ENABLE_HISTOGRAM needs the DEV_SHARC_HISTOGRAM_* layout macros; the RTXGI sample defines them in DevSharc.h"
+#endif
+
 #ifndef RW_STRUCTURED_BUFFER
 #define RW_STRUCTURED_BUFFER(name, type) RWStructuredBuffer<type> name
 #endif
@@ -126,10 +141,15 @@ struct SharcParameters
     HashGridParameters gridParameters;
     HashMapData hashMapData;
     float radianceScale;            // quantization factor for atomic radiance accumulation (u32 per channel during SHARC_UPDATE). Start with 1e3f; reduce for large radiance values to prevent overflow
+#if DEV_SHARC_ENABLE_FIREFLY
     bool enableAntiFireflyFilter;
+#endif // DEV_SHARC_ENABLE_FIREFLY
 
     RW_STRUCTURED_BUFFER(accumulationBuffer, SharcAccumulationData);
     RW_STRUCTURED_BUFFER(resolvedBuffer, SharcPackedData);
+#if DEV_SHARC_ENABLE_HISTOGRAM && SHARC_UPDATE
+    RW_STRUCTURED_BUFFER(devHistogramBuffer, uint);    // layout defined by the host (DevSharc.h): watch list, counters, keys, samples
+#endif // DEV_SHARC_ENABLE_HISTOGRAM && SHARC_UPDATE
 };
 
 struct SharcState
@@ -138,6 +158,10 @@ struct SharcState
     HashGridIndex cacheIndices[SHARC_PROPAGATION_DEPTH];
     SharcSampleWeight sampleWeights[SHARC_PROPAGATION_DEPTH];
     uint pathLength;
+#if DEV_SHARC_ENABLE_HISTOGRAM
+    uint3 devContribQ[SHARC_PROPAGATION_DEPTH];     // quantized total this path has deposited into each live slot so far
+    uint devSampleMask;                             // bit i set when slot i received a direct deposit, i.e. the cache counts it as a sample
+#endif // DEV_SHARC_ENABLE_HISTOGRAM
 #endif // SHARC_UPDATE
     uint placeholder;
 };
@@ -223,11 +247,15 @@ float SharcLuma(float3 color)
     return dot(color, luma);
 }
 
-void SharcAddVoxelData(in SharcParameters sharcParameters, HashGridIndex cacheIndex, float3 sampleValue, float3 sampleWeight, uint sampleData)
+// Returns the quantized value actually added to the accumulator (zero for an invalid index), so a
+// caller can total what one path deposits into a voxel without re-deriving the filter and the
+// quantization. Callers that do not need it ignore the return value.
+uint3 SharcAddVoxelData(in SharcParameters sharcParameters, HashGridIndex cacheIndex, float3 sampleValue, float3 sampleWeight, uint sampleData)
 {
     if (cacheIndex == HASH_GRID_INVALID_CACHE_INDEX)
-        return;
+        return uint3(0, 0, 0);
 
+#if DEV_SHARC_ENABLE_FIREFLY
     if (sharcParameters.enableAntiFireflyFilter)
     {
         float scalarWeight = SharcLuma(sampleWeight);
@@ -254,6 +282,7 @@ void SharcAddVoxelData(in SharcParameters sharcParameters, HashGridIndex cacheIn
             }
         }
     }
+#endif // DEV_SHARC_ENABLE_FIREFLY
 
     uint3 scaledRadiance = uint3(sampleValue * sampleWeight * sharcParameters.radianceScale);
 
@@ -261,20 +290,98 @@ void SharcAddVoxelData(in SharcParameters sharcParameters, HashGridIndex cacheIn
     if (scaledRadiance.y != 0) InterlockedAdd(BUFFER_AT_OFFSET(sharcParameters.accumulationBuffer, cacheIndex).data.y, scaledRadiance.y);
     if (scaledRadiance.z != 0) InterlockedAdd(BUFFER_AT_OFFSET(sharcParameters.accumulationBuffer, cacheIndex).data.z, scaledRadiance.z);
     if (sampleData != 0) InterlockedAdd(BUFFER_AT_OFFSET(sharcParameters.accumulationBuffer, cacheIndex).data.w, sampleData);
+
+    return scaledRadiance;
 }
+
+#if DEV_SHARC_ENABLE_HISTOGRAM && SHARC_UPDATE
+// Development instrumentation: per-path deposit totals for a small set of watched voxels.
+// A "sample" is what the cache counts as one -- everything a single path deposits into a voxel,
+// its direct lighting at the hit plus the radiance propagated back from later bounces -- taken
+// after the anti-firefly rescale and the quantization, so it is exactly what the accumulator
+// received. The buffer layout is the host's (DevSharc.h).
+
+// Records one completed per-path total if cacheIndex is watched. The counter is bumped past the
+// capacity on purpose: the host reads count >= capacity as complete and can see how many were dropped.
+void SharcDevRecordPathDeposit(in SharcParameters sharcParameters, HashGridIndex cacheIndex, uint3 depositQ)
+{
+    if (cacheIndex == HASH_GRID_INVALID_CACHE_INDEX)
+        return;
+
+    for (uint voxel = 0; voxel < DEV_SHARC_HISTOGRAM_VOXELS; ++voxel)
+    {
+        if (BUFFER_AT_OFFSET(sharcParameters.devHistogramBuffer, DEV_SHARC_HISTOGRAM_WATCH_OFFSET + voxel) != cacheIndex)
+            continue;
+
+        uint slot;
+        InterlockedAdd(BUFFER_AT_OFFSET(sharcParameters.devHistogramBuffer, DEV_SHARC_HISTOGRAM_COUNT_OFFSET + voxel), 1, slot);
+        if (slot < DEV_SHARC_NUM_HISTOGRAM_SAMPLES)
+        {
+            uint offset = DEV_SHARC_HISTOGRAM_HEADER_SIZE + (voxel * DEV_SHARC_NUM_HISTOGRAM_SAMPLES + slot) * DEV_SHARC_HISTOGRAM_SAMPLE_STRIDE;
+            BUFFER_AT_OFFSET(sharcParameters.devHistogramBuffer, offset + 0) = depositQ.x;
+            BUFFER_AT_OFFSET(sharcParameters.devHistogramBuffer, offset + 1) = depositQ.y;
+            BUFFER_AT_OFFSET(sharcParameters.devHistogramBuffer, offset + 2) = depositQ.z;
+            BUFFER_AT_OFFSET(sharcParameters.devHistogramBuffer, offset + 3) = 0;
+        }
+        break; // a cache index is watched at most once
+    }
+}
+
+// Call once at every path exit. Flushes the live slots that received a direct deposit. A slot
+// pushed by a resampling early-out never did, and is skipped exactly as the cache skips it.
+void SharcDevFlushPath(in SharcParameters sharcParameters, in SharcState sharcState)
+{
+    for (uint i = 0; i < sharcState.pathLength; ++i)
+    {
+        if (sharcState.devSampleMask & (1u << i))
+            SharcDevRecordPathDeposit(sharcParameters, sharcState.cacheIndices[i], sharcState.devContribQ[i]);
+    }
+}
+
+// Voxel selection: the launch grid is split into DEV_SHARC_HISTOGRAM_GRID x GRID cells and the
+// thread at each cell's centre records the cache index and hash key of its primary hit. Call right
+// after the first SharcUpdateHit of a path, on the one frame the host flags for selection. Cells
+// whose primary ray missed never get here and keep the host's HASH_GRID_INVALID_CACHE_INDEX fill.
+void SharcDevSelectVoxel(in SharcParameters sharcParameters, in SharcState sharcState, uint2 launchIndex, uint2 launchDimensions)
+{
+    const uint2 cellSize = max(launchDimensions / DEV_SHARC_HISTOGRAM_GRID, uint2(1, 1));
+    const uint2 cell = launchIndex / cellSize;
+    if (any(cell >= DEV_SHARC_HISTOGRAM_GRID) || any(launchIndex != cell * cellSize + cellSize / 2))
+        return;
+
+    const uint voxel = cell.y * DEV_SHARC_HISTOGRAM_GRID + cell.x;
+    const HashGridIndex cacheIndex = sharcState.cacheIndices[0];
+    HashGridKey hashKey = HASH_GRID_INVALID_HASH_KEY;
+    if (cacheIndex != HASH_GRID_INVALID_CACHE_INDEX)
+        hashKey = BUFFER_AT_OFFSET(sharcParameters.hashMapData.hashEntriesBuffer, cacheIndex);
+
+    BUFFER_AT_OFFSET(sharcParameters.devHistogramBuffer, DEV_SHARC_HISTOGRAM_WATCH_OFFSET + voxel) = cacheIndex;
+    BUFFER_AT_OFFSET(sharcParameters.devHistogramBuffer, DEV_SHARC_HISTOGRAM_KEY_OFFSET + 2 * voxel + 0) = uint(hashKey & 0xFFFFFFFFu);
+    BUFFER_AT_OFFSET(sharcParameters.devHistogramBuffer, DEV_SHARC_HISTOGRAM_KEY_OFFSET + 2 * voxel + 1) = uint(hashKey >> 32);
+}
+#endif // DEV_SHARC_ENABLE_HISTOGRAM && SHARC_UPDATE
 
 void SharcInit(inout SharcState sharcState)
 {
 #if SHARC_UPDATE
     sharcState.pathLength = 0;
+#if DEV_SHARC_ENABLE_HISTOGRAM
+    sharcState.devSampleMask = 0;
+#endif // DEV_SHARC_ENABLE_HISTOGRAM
 #endif // SHARC_UPDATE
 }
 
-void SharcUpdateMiss(in SharcParameters sharcParameters, in SharcState sharcState, float3 radiance)
+// inout rather than in so the per-path totals can be accumulated; the cache update itself is unchanged.
+void SharcUpdateMiss(in SharcParameters sharcParameters, inout SharcState sharcState, float3 radiance)
 {
 #if SHARC_UPDATE
     for (int i = 0; i < sharcState.pathLength; ++i)
-        SharcAddVoxelData(sharcParameters, sharcState.cacheIndices[i], radiance, sharcState.sampleWeights[i], 0);
+    {
+        uint3 depositQ = SharcAddVoxelData(sharcParameters, sharcState.cacheIndices[i], radiance, sharcState.sampleWeights[i], 0);
+#if DEV_SHARC_ENABLE_HISTOGRAM
+        sharcState.devContribQ[i] += depositQ;
+#endif // DEV_SHARC_ENABLE_HISTOGRAM
+    }
 #endif // SHARC_UPDATE
 }
 
@@ -304,8 +411,9 @@ bool SharcUpdateHit(in SharcParameters sharcParameters, inout SharcState sharcSt
     }
 #endif // SHARC_ENABLE_CACHE_RESAMPLING
 
+    uint3 directDepositQ = uint3(0, 0, 0);
     if (continueTracing)
-        SharcAddVoxelData(sharcParameters, cacheIndex, directLighting / materialDemodulation, float3(1.0f, 1.0f, 1.0f), 1);
+        directDepositQ = SharcAddVoxelData(sharcParameters, cacheIndex, directLighting / materialDemodulation, float3(1.0f, 1.0f, 1.0f), 1);
 
 #if SHARC_SEPARATE_EMISSIVE
     sharcRadiance += sharcHitData.emissive;
@@ -313,16 +421,36 @@ bool SharcUpdateHit(in SharcParameters sharcParameters, inout SharcState sharcSt
 
     uint i;
     for (i = 0; i < sharcState.pathLength; ++i)
-        SharcAddVoxelData(sharcParameters, sharcState.cacheIndices[i], sharcRadiance, sharcState.sampleWeights[i], 0);
+    {
+        uint3 depositQ = SharcAddVoxelData(sharcParameters, sharcState.cacheIndices[i], sharcRadiance, sharcState.sampleWeights[i], 0);
+#if DEV_SHARC_ENABLE_HISTOGRAM
+        sharcState.devContribQ[i] += depositQ;
+#endif // DEV_SHARC_ENABLE_HISTOGRAM
+    }
+
+#if DEV_SHARC_ENABLE_HISTOGRAM
+    // The slot about to be shifted into index SHARC_PROPAGATION_DEPTH - 1 leaves the propagation
+    // window and receives nothing further from this path: its per-path total is complete.
+    if (sharcState.pathLength == SHARC_PROPAGATION_DEPTH - 1 && (sharcState.devSampleMask & (1u << (SHARC_PROPAGATION_DEPTH - 2))))
+        SharcDevRecordPathDeposit(sharcParameters, sharcState.cacheIndices[SHARC_PROPAGATION_DEPTH - 2], sharcState.devContribQ[SHARC_PROPAGATION_DEPTH - 2]);
+#endif // DEV_SHARC_ENABLE_HISTOGRAM
 
     for (i = sharcState.pathLength; i > 0; --i)
     {
         sharcState.cacheIndices[i] = sharcState.cacheIndices[i - 1];
         sharcState.sampleWeights[i] = sharcState.sampleWeights[i - 1];
+#if DEV_SHARC_ENABLE_HISTOGRAM
+        sharcState.devContribQ[i] = sharcState.devContribQ[i - 1];
+#endif // DEV_SHARC_ENABLE_HISTOGRAM
     }
 
     sharcState.cacheIndices[0] = cacheIndex;
     sharcState.sampleWeights[0] = SharcSampleWeight(1.0f / materialDemodulation);
+#if DEV_SHARC_ENABLE_HISTOGRAM
+    // A resampling early-out pushes the vertex without a direct deposit; it is not a sample.
+    sharcState.devContribQ[0] = directDepositQ;
+    sharcState.devSampleMask = ((sharcState.devSampleMask << 1) | (continueTracing ? 1u : 0u)) & ((1u << SHARC_PROPAGATION_DEPTH) - 1u);
+#endif // DEV_SHARC_ENABLE_HISTOGRAM
     sharcState.pathLength = min(++sharcState.pathLength, SHARC_PROPAGATION_DEPTH - 1);
 #endif // SHARC_UPDATE
     return continueTracing;
