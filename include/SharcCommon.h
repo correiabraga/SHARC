@@ -167,7 +167,7 @@ struct SharcResolveParameters
     bool enableAntiFireflyFilter;   // not used
 };
 
-SharcPackedData SharcPackVoxelData(float3 radiance, float sampleNum, uint accumulatedFrameNum, uint staleFrameNum)
+SharcPackedData SharcPackVoxelData(float3 radiance, float sampleNum, uint accumulatedFrameNum, uint staleFrameNum, float luminanceM2)
 {
     const float float16Max = 65504.0f;
 
@@ -177,7 +177,7 @@ SharcPackedData SharcPackVoxelData(float3 radiance, float sampleNum, uint accumu
     packedData.radianceData.z = float16_t(min(radiance.z, float16Max));
     packedData.radianceData.w = float16_t(min(sampleNum, float16Max));
     packedData.sampleData.x = accumulatedFrameNum | (staleFrameNum << SHARC_STALE_FRAME_NUM_BIT_OFFSET);
-    packedData.luminanceM2 = 0; // not used
+    packedData.luminanceM2 = asuint(luminanceM2);
 
     return packedData;
 }
@@ -352,6 +352,53 @@ bool SharcGetCachedRadiance(in SharcParameters sharcParameters, in SharcHitData 
     return false;
 }
 
+// Luminance variance support. SharcResolveEntry keeps SharcPackedData::luminanceM2 as a weight-extensive
+// second moment (M2 = sum w (x - mean)^2) of the voxel's luminance, built from per-frame means with the
+// Chan-Golub-LeVeque merge and decayed under the same exponential window as the mean. Only the resolve pass
+// writes it; the UPDATE and QUERY paths are unchanged. Derivation and caveats: WorknotesSharcVariance.md
+// Note 1 in the RTXGI-Develop-Firefly analysis repo.
+
+float SharcLuminance(float3 radiance)
+{
+    return dot(radiance, float3(0.2126f, 0.7152f, 0.0722f));
+}
+
+// Merges one weighted observation (a frame mean, or a neighbouring voxel's mean) into a running M2.
+// The only term added is a squared difference scaled by non-negative weights, so there is no cancellation.
+float SharcMergeLuminanceM2(float m2Prev, float lumaPrev, float weightPrev, float lumaNew, float weightNew)
+{
+    float delta = lumaNew - lumaPrev;
+    return m2Prev + delta * delta * weightPrev * weightNew * rcp(weightPrev + weightNew);
+}
+
+// Per-sample luminance variance from the stored second moment. Because each merged observation is a frame
+// MEAN weighted by its sample count, the expectation of M2 is (frames - 1) * sigma^2 regardless of how many
+// samples each frame contributed - so the divisor is the frame count, not the sample weight (dividing by the
+// sample weight would give sigma^2 / samplesPerFrame, an update-pass density artefact). Once the window has
+// saturated the exact divisor is 2A(A+1)/(2A+1) for window A; K-1 reads ~16% high on variance at A = 10 and
+// converges for larger windows. Callers must treat accumulatedFrameNum < 2 as "no estimate".
+float SharcLuminanceVariance(float luminanceM2, uint accumulatedFrameNum)
+{
+    return luminanceM2 * rcp(max(float(accumulatedFrameNum) - 1.0f, 1.0f));
+}
+
+// New accessor alongside SharcGetCachedRadiance; that function and the update path are not modified.
+bool SharcGetCachedVariance(in SharcParameters sharcParameters, in SharcHitData sharcHitData, out float variance)
+{
+    variance = 0.0f;
+
+    HashGridIndex cacheIndex = HashMapFindEntry(sharcParameters.hashMapData, sharcHitData.positionWorld, sharcHitData.normalWorld, sharcParameters.gridParameters);
+    if (cacheIndex == HASH_GRID_INVALID_CACHE_INDEX)
+        return false;
+
+    SharcVoxelData voxelData = SharcGetVoxelData(sharcParameters.resolvedBuffer, cacheIndex);
+    if (voxelData.accumulatedSampleNum <= SHARC_SAMPLE_NUM_THRESHOLD || voxelData.accumulatedFrameNum < 2)
+        return false;
+
+    variance = SharcLuminanceVariance(voxelData.luminanceM2, voxelData.accumulatedFrameNum);
+    return true;
+}
+
 int SharcGetGridDistance2(int3 position)
 {
     return position.x * position.x + position.y * position.y + position.z * position.z;
@@ -470,6 +517,7 @@ void SharcResolveEntry(uint entryIndex, SharcParameters sharcParameters, SharcRe
 
     float3 accumulatedRadiance = float3(accumulatedData.data.xyz) * rcp(sharcParameters.radianceScale);
     float3 accumulatedRadiancePrev = sharcVoxelData.accumulatedRadiance;
+    float luminanceM2 = sharcVoxelData.luminanceM2;
 
     uint accumulationFrameNum = clamp(resolveParameters.accumulationFrameNum, SHARC_ACCUMULATED_FRAME_NUM_MIN, SHARC_ACCUMULATED_FRAME_NUM_MAX);
     if (accumulatedFrameNum > accumulationFrameNum)
@@ -477,11 +525,19 @@ void SharcResolveEntry(uint entryIndex, SharcParameters sharcParameters, SharcRe
         float normalizationScale = float(accumulationFrameNum) / float(accumulatedFrameNum);
         accumulatedFrameNum = accumulationFrameNum;
         sampleNumPrev *= normalizationScale;
+        // M2 is extensive in the same weight, so it must decay with it or it accumulates without bound
+        luminanceM2 *= normalizationScale;
     }
 
     float sampleTotalInv = rcp(sampleNumPrev + sampleNum);
 
     accumulatedRadiance = accumulatedRadiance / max(sampleNum, 1e-6f);
+
+    // This frame's mean enters the variance as one observation of weight sampleNum, with the same weights
+    // the mean blend below uses. Only per-frame sums reach the resolve pass, so this is the spread of frame
+    // means, not of individual paths; SharcLuminanceVariance converts it back to a per-sample variance.
+    luminanceM2 = SharcMergeLuminanceM2(luminanceM2, SharcLuminance(accumulatedRadiancePrev), sampleNumPrev, SharcLuminance(accumulatedRadiance), sampleNum);
+
     accumulatedRadiance = sampleNumPrev * sampleTotalInv * accumulatedRadiancePrev + sampleNum * sampleTotalInv * accumulatedRadiance;
     float accumulatedSampleNum = sampleNumPrev + sampleNum;
 
@@ -502,6 +558,13 @@ void SharcResolveEntry(uint entryIndex, SharcParameters sharcParameters, SharcRe
             if (adjacentSampleNum > SHARC_SAMPLE_NUM_THRESHOLD)
             {
                 float blendWeight = rcp(adjacentSampleNum + accumulatedSampleNum);
+
+                // The neighbour enters the variance as one observation of weight adjacentSampleNum, like a
+                // frame. Its own M2 is deliberately not imported: this record's frame count is not increased
+                // by the blend, so pooling a converged neighbour's spread into a young voxel would inflate
+                // the per-frame variance by the ratio of their frame counts.
+                luminanceM2 = SharcMergeLuminanceM2(luminanceM2, SharcLuminance(accumulatedRadiance.xyz), accumulatedSampleNum, SharcLuminance(adjacentVoxelDataPrev.accumulatedRadiance), adjacentSampleNum);
+
                 accumulatedRadiance = adjacentSampleNum * blendWeight * adjacentVoxelDataPrev.accumulatedRadiance + accumulatedSampleNum * blendWeight * accumulatedRadiance.xyz;
                 accumulatedSampleNum += adjacentSampleNum;
             }
@@ -509,7 +572,10 @@ void SharcResolveEntry(uint entryIndex, SharcParameters sharcParameters, SharcRe
     }
 #endif // SHARC_BLEND_ADJACENT_LEVELS
 
-    BUFFER_AT_OFFSET(sharcParameters.resolvedBuffer, entryIndex) = SharcPackVoxelData(accumulatedRadiance, accumulatedSampleNum, accumulatedFrameNum, staleFrameNum);
+    // Every term added above is >= 0; this exists to map a NaN to 0 (DXIL fmax drops the NaN operand) so a
+    // single corrupt frame cannot poison the recursion permanently.
+    luminanceM2 = max(luminanceM2, 0.0f);
+    BUFFER_AT_OFFSET(sharcParameters.resolvedBuffer, entryIndex) = SharcPackVoxelData(accumulatedRadiance, accumulatedSampleNum, accumulatedFrameNum, staleFrameNum, luminanceM2);
 
     // Clear buffer entry for the next frame
     SharcAccumulationData zeroAccumulationData;
