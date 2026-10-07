@@ -20,7 +20,7 @@ struct SharcPackedData
 {
     float16_t4 radianceData;
     uint sampleData;
-    uint luminanceM2;
+    uint luminanceStats;    // luminance spread statistic (see SHARC_ENABLE_STANDARD_DEVIATION): fp32 bits of the EWMA second moment M2, or two fp16 halves - ln-luminance median (low) and MAD (high)
 };
 
 #if SHARC_ENABLE_GLSL

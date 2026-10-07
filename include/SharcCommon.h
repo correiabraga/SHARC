@@ -69,6 +69,22 @@
 #define SHARC_USE_FP16                          0       // use fp16 for sample weights storage
 #endif
 
+#ifndef SHARC_ENABLE_STANDARD_DEVIATION
+#define SHARC_ENABLE_STANDARD_DEVIATION         0       // per-voxel luminance spread: 1 = EWMA second moment M2 (sqrt(M2/(K-1))), 0 = streaming median / MAD of ln(luminance)
+#endif
+
+#ifndef SHARC_LOG_STEP_FRACTION
+#define SHARC_LOG_STEP_FRACTION                 0.1f    // the one sign-step shared by the streaming median and MAD, as a fraction of the current MAD (scale-aware)
+#endif
+
+#ifndef SHARC_LOG_STEP_MIN
+#define SHARC_LOG_STEP_MIN                      0.02f   // floor on that step and on the stored MAD, in ln units (~2% luminance): above the fp16 ulp; a stored MAD of exactly 0 then means "no observation yet"
+#endif
+
+#ifndef SHARC_LOG_MAD_INITIAL
+#define SHARC_LOG_MAD_INITIAL                   0.3f    // MAD seed on a voxel's first observed (non-black) frame, in ln units
+#endif
+
 #ifndef RW_STRUCTURED_BUFFER
 #define RW_STRUCTURED_BUFFER(name, type) RWStructuredBuffer<type> name
 #endif
@@ -150,13 +166,25 @@ struct SharcHitData
 #endif // SHARC_SEPARATE_EMISSIVE
 };
 
+// Per-voxel spread statistic of the stored luminance, maintained by SharcResolveEntry (see the helpers after
+// SharcGetCachedRadiance). Stored in SharcPackedData::luminanceStats, 32 bits either way.
+struct SharcLuminanceStats
+{
+#if SHARC_ENABLE_STANDARD_DEVIATION
+    float m2;               // weight-extensive second moment sum w (luma - mean)^2 over the EWMA window; variance = m2 / (K - 1)
+#else
+    float logMedian;        // streaming median of ln(luminance of the frame mean)
+    float logMad;           // streaming median of |ln(luminance) - logMedian|, >= SHARC_LOG_STEP_MIN once seeded (exactly 0 = no observation yet); robust sigma = 1.4826 * logMad
+#endif
+};
+
 struct SharcVoxelData
 {
     float3 accumulatedRadiance;
     float accumulatedSampleNum;
     uint accumulatedFrameNum;
     uint staleFrameNum;
-    float luminanceM2;
+    SharcLuminanceStats luminance;
 };
 
 struct SharcResolveParameters
@@ -167,7 +195,28 @@ struct SharcResolveParameters
     bool enableAntiFireflyFilter;   // not used
 };
 
-SharcPackedData SharcPackVoxelData(float3 radiance, float sampleNum, uint accumulatedFrameNum, uint staleFrameNum, float luminanceM2)
+uint SharcPackLuminanceStats(SharcLuminanceStats stats)
+{
+#if SHARC_ENABLE_STANDARD_DEVIATION
+    return asuint(stats.m2);
+#else
+    return (f32tof16(stats.logMedian) & 0xFFFFu) | (f32tof16(stats.logMad) << 16);
+#endif
+}
+
+SharcLuminanceStats SharcUnpackLuminanceStats(uint packed)
+{
+    SharcLuminanceStats stats;
+#if SHARC_ENABLE_STANDARD_DEVIATION
+    stats.m2 = asfloat(packed);
+#else
+    stats.logMedian = f16tof32(packed & 0xFFFFu);
+    stats.logMad = f16tof32(packed >> 16);
+#endif
+    return stats;
+}
+
+SharcPackedData SharcPackVoxelData(float3 radiance, float sampleNum, uint accumulatedFrameNum, uint staleFrameNum, SharcLuminanceStats luminance)
 {
     const float float16Max = 65504.0f;
 
@@ -177,7 +226,7 @@ SharcPackedData SharcPackVoxelData(float3 radiance, float sampleNum, uint accumu
     packedData.radianceData.z = float16_t(min(radiance.z, float16Max));
     packedData.radianceData.w = float16_t(min(sampleNum, float16Max));
     packedData.sampleData.x = accumulatedFrameNum | (staleFrameNum << SHARC_STALE_FRAME_NUM_BIT_OFFSET);
-    packedData.luminanceM2 = asuint(luminanceM2);
+    packedData.luminanceStats = SharcPackLuminanceStats(luminance);
 
     return packedData;
 }
@@ -191,7 +240,7 @@ SharcVoxelData SharcUnpackVoxelData(SharcPackedData packedData)
     voxelData.accumulatedSampleNum = float(packedData.radianceData.w);
     voxelData.accumulatedFrameNum = (packedData.sampleData >> SHARC_ACCUMULATED_FRAME_NUM_BIT_OFFSET) & SHARC_ACCUMULATED_FRAME_NUM_BIT_MASK;
     voxelData.staleFrameNum = (packedData.sampleData >> SHARC_STALE_FRAME_NUM_BIT_OFFSET) & SHARC_STALE_FRAME_NUM_BIT_MASK;
-    voxelData.luminanceM2 = asfloat(packedData.luminanceM2);
+    voxelData.luminance = SharcUnpackLuminanceStats(packedData.luminanceStats);
 
     return voxelData;
 }
@@ -203,6 +252,7 @@ SharcVoxelData SharcGetVoxelData(RW_STRUCTURED_BUFFER(voxelDataBuffer, SharcPack
     voxelData.accumulatedSampleNum = 0;
     voxelData.accumulatedFrameNum = 0;
     voxelData.staleFrameNum = 0;
+    voxelData.luminance = SharcUnpackLuminanceStats(0u);
 
     if (cacheIndex == HASH_GRID_INVALID_CACHE_INDEX)
         return voxelData;
@@ -352,16 +402,23 @@ bool SharcGetCachedRadiance(in SharcParameters sharcParameters, in SharcHitData 
     return false;
 }
 
-// Luminance variance support. SharcResolveEntry keeps SharcPackedData::luminanceM2 as a weight-extensive
-// second moment (M2 = sum w (x - mean)^2) of the voxel's luminance, built from per-frame means with the
-// Chan-Golub-LeVeque merge and decayed under the same exponential window as the mean. Only the resolve pass
-// writes it; the UPDATE and QUERY paths are unchanged. Derivation and caveats: WorknotesSharcVariance.md
-// Note 1 in the RTXGI-Develop-Firefly analysis repo.
+// Luminance spread support. SharcResolveEntry maintains SharcPackedData::luminanceStats from the per-frame means
+// it sees - only the resolve pass writes it; the UPDATE and QUERY paths are unchanged. Two statistics, selected by
+// SHARC_ENABLE_STANDARD_DEVIATION:
+//   1: a weight-extensive second moment M2 = sum w (luma - mean)^2 built with the Chan-Golub-LeVeque merge and
+//      decayed under the same exponential window as the mean (WorknotesSharcVariance.md sections 1-2).
+//   0: a streaming median and median absolute deviation of ln(luminance) - sign-step (Frugal) estimators, one
+//      step per contributing frame - with 1.4826 * MAD estimating the standard deviation of the underlying normal
+//      distribution of a lognormal signal (Knowledge.md, "Moving MAD"). Medians are far less sensitive than M2
+//      to a spike population, but not immune: each observation is a frame mean of n deposits, so a spike
+//      fraction p among deposits reaches 1 - (1 - p)^n of the frame means (WorknotesSharcVariance.md section 4).
 
 float SharcLuminance(float3 radiance)
 {
     return dot(radiance, float3(0.2126f, 0.7152f, 0.0722f));
 }
+
+#if SHARC_ENABLE_STANDARD_DEVIATION
 
 // Merges one weighted observation (a frame mean, or a neighbouring voxel's mean) into a running M2.
 // The only term added is a squared difference scaled by non-negative weights, so there is no cancellation.
@@ -395,9 +452,71 @@ bool SharcGetCachedVariance(in SharcParameters sharcParameters, in SharcHitData 
     if (voxelData.accumulatedSampleNum <= SHARC_SAMPLE_NUM_THRESHOLD || voxelData.accumulatedFrameNum < 2)
         return false;
 
-    variance = SharcLuminanceVariance(voxelData.luminanceM2, voxelData.accumulatedFrameNum);
+    variance = SharcLuminanceVariance(voxelData.luminance.m2, voxelData.accumulatedFrameNum);
     return true;
 }
+
+#else // !SHARC_ENABLE_STANDARD_DEVIATION
+
+// One sign-step of the streaming median and MAD with this frame's observation y = ln(luminance of the frame
+// mean). The median moves one step towards y and the MAD one step towards |y - median|; with symmetric steps
+// each estimate settles where half of its observations fall on either side - the median by definition. The step
+// is a fraction of the current MAD (scale-aware: a wide distribution is tracked faster, a narrow one more finely),
+// floored so it stays above the fp16 storage ulp. The stored MAD is floored at the same value, so a MAD of
+// exactly 0 - a fresh or evicted record, or one that has only seen black frames - means "no observation yet", and
+// the first observed frame seeds the median with y and the MAD with a prior. Black frames (luminance 0) carry no
+// information about the spread of a lognormal signal and are skipped.
+void SharcUpdateLogStatistics(inout SharcLuminanceStats stats, float lumaFrame)
+{
+    if (!(lumaFrame > 0.0f))
+        return;
+
+    float y = log(lumaFrame);
+    if (stats.logMad == 0.0f)
+    {
+        stats.logMedian = y;
+        stats.logMad = SHARC_LOG_MAD_INITIAL;
+        return;
+    }
+
+    float step = max(SHARC_LOG_STEP_FRACTION * stats.logMad, SHARC_LOG_STEP_MIN);
+    stats.logMedian += step * sign(y - stats.logMedian);
+    float deviation = abs(y - stats.logMedian);
+    stats.logMad = max(stats.logMad + step * sign(deviation - stats.logMad), SHARC_LOG_STEP_MIN);
+}
+
+// Standard deviation of ln(luminance) implied by the MAD, assuming the underlying distribution is normal
+// (i.e. the luminance is lognormal): 1 / PHI^-1(0.75) = 1.4826. Dimensionless; exp(logMedian) is the
+// geometric-mean luminance in the cache's units.
+float SharcRobustLogSigma(SharcLuminanceStats stats)
+{
+    return 1.4826f * stats.logMad;
+}
+
+// New accessor alongside SharcGetCachedRadiance; that function and the update path are not modified. Returns
+// the voxel's ln-luminance median and robust sigma, or false (zeros) when there is no entry, no samples, or no
+// observed frame yet (MAD still 0). Early values are dominated by the prior: the first observed frame returns
+// sigma = 1.4826 * SHARC_LOG_MAD_INITIAL and the step rule needs on the order of ten observed frames to settle
+// on the voxel's own spread.
+bool SharcGetCachedLogStatistics(in SharcParameters sharcParameters, in SharcHitData sharcHitData, out float logMedian, out float robustSigma)
+{
+    logMedian = 0.0f;
+    robustSigma = 0.0f;
+
+    HashGridIndex cacheIndex = HashMapFindEntry(sharcParameters.hashMapData, sharcHitData.positionWorld, sharcHitData.normalWorld, sharcParameters.gridParameters);
+    if (cacheIndex == HASH_GRID_INVALID_CACHE_INDEX)
+        return false;
+
+    SharcVoxelData voxelData = SharcGetVoxelData(sharcParameters.resolvedBuffer, cacheIndex);
+    if (voxelData.accumulatedSampleNum <= SHARC_SAMPLE_NUM_THRESHOLD || voxelData.luminance.logMad == 0.0f)
+        return false;
+
+    logMedian = voxelData.luminance.logMedian;
+    robustSigma = SharcRobustLogSigma(voxelData.luminance);
+    return true;
+}
+
+#endif // SHARC_ENABLE_STANDARD_DEVIATION
 
 int SharcGetGridDistance2(int3 position)
 {
@@ -483,7 +602,7 @@ void SharcResolveEntry(uint entryIndex, SharcParameters sharcParameters, SharcRe
         SharcPackedData zeroPackedData;
         zeroPackedData.radianceData = float16_t4(0, 0, 0, 0);
         zeroPackedData.sampleData = 0;
-        zeroPackedData.luminanceM2 = 0;
+        zeroPackedData.luminanceStats = 0;
 
         BUFFER_AT_OFFSET(sharcParameters.hashMapData.hashEntriesBuffer, entryIndex) = HASH_GRID_INVALID_HASH_KEY;
         BUFFER_AT_OFFSET(sharcParameters.accumulationBuffer, entryIndex) = zeroAccumulationData;
@@ -517,7 +636,7 @@ void SharcResolveEntry(uint entryIndex, SharcParameters sharcParameters, SharcRe
 
     float3 accumulatedRadiance = float3(accumulatedData.data.xyz) * rcp(sharcParameters.radianceScale);
     float3 accumulatedRadiancePrev = sharcVoxelData.accumulatedRadiance;
-    float luminanceM2 = sharcVoxelData.luminanceM2;
+    SharcLuminanceStats luminance = sharcVoxelData.luminance;
 
     uint accumulationFrameNum = clamp(resolveParameters.accumulationFrameNum, SHARC_ACCUMULATED_FRAME_NUM_MIN, SHARC_ACCUMULATED_FRAME_NUM_MAX);
     if (accumulatedFrameNum > accumulationFrameNum)
@@ -525,18 +644,27 @@ void SharcResolveEntry(uint entryIndex, SharcParameters sharcParameters, SharcRe
         float normalizationScale = float(accumulationFrameNum) / float(accumulatedFrameNum);
         accumulatedFrameNum = accumulationFrameNum;
         sampleNumPrev *= normalizationScale;
+#if SHARC_ENABLE_STANDARD_DEVIATION
         // M2 is extensive in the same weight, so it must decay with it or it accumulates without bound
-        luminanceM2 *= normalizationScale;
+        luminance.m2 *= normalizationScale;
+#endif
     }
 
     float sampleTotalInv = rcp(sampleNumPrev + sampleNum);
 
     accumulatedRadiance = accumulatedRadiance / max(sampleNum, 1e-6f);
 
+#if SHARC_ENABLE_STANDARD_DEVIATION
     // This frame's mean enters the variance as one observation of weight sampleNum, with the same weights
     // the mean blend below uses. Only per-frame sums reach the resolve pass, so this is the spread of frame
     // means, not of individual paths; SharcLuminanceVariance converts it back to a per-sample variance.
-    luminanceM2 = SharcMergeLuminanceM2(luminanceM2, SharcLuminance(accumulatedRadiancePrev), sampleNumPrev, SharcLuminance(accumulatedRadiance), sampleNum);
+    luminance.m2 = SharcMergeLuminanceM2(luminance.m2, SharcLuminance(accumulatedRadiancePrev), sampleNumPrev, SharcLuminance(accumulatedRadiance), sampleNum);
+#else
+    // This frame's mean is one observation of the ln-luminance stream; only per-frame sums reach the resolve
+    // pass, so the median and MAD describe the frame means, not individual paths. A fresh record (MAD 0) is
+    // seeded here; a record recovered by the linear probe above carries its statistics and is not.
+    SharcUpdateLogStatistics(luminance, SharcLuminance(accumulatedRadiance));
+#endif
 
     accumulatedRadiance = sampleNumPrev * sampleTotalInv * accumulatedRadiancePrev + sampleNum * sampleTotalInv * accumulatedRadiance;
     float accumulatedSampleNum = sampleNumPrev + sampleNum;
@@ -559,11 +687,15 @@ void SharcResolveEntry(uint entryIndex, SharcParameters sharcParameters, SharcRe
             {
                 float blendWeight = rcp(adjacentSampleNum + accumulatedSampleNum);
 
+#if SHARC_ENABLE_STANDARD_DEVIATION
                 // The neighbour enters the variance as one observation of weight adjacentSampleNum, like a
                 // frame. Its own M2 is deliberately not imported: this record's frame count is not increased
                 // by the blend, so pooling a converged neighbour's spread into a young voxel would inflate
                 // the per-frame variance by the ratio of their frame counts.
-                luminanceM2 = SharcMergeLuminanceM2(luminanceM2, SharcLuminance(accumulatedRadiance.xyz), accumulatedSampleNum, SharcLuminance(adjacentVoxelDataPrev.accumulatedRadiance), adjacentSampleNum);
+                luminance.m2 = SharcMergeLuminanceM2(luminance.m2, SharcLuminance(accumulatedRadiance.xyz), accumulatedSampleNum, SharcLuminance(adjacentVoxelDataPrev.accumulatedRadiance), adjacentSampleNum);
+#endif
+                // (median / MAD path: order statistics have no pooled form; the neighbour's mean is not an
+                // observation of this voxel's stream, so the statistics are left as they are.)
 
                 accumulatedRadiance = adjacentSampleNum * blendWeight * adjacentVoxelDataPrev.accumulatedRadiance + accumulatedSampleNum * blendWeight * accumulatedRadiance.xyz;
                 accumulatedSampleNum += adjacentSampleNum;
@@ -572,10 +704,12 @@ void SharcResolveEntry(uint entryIndex, SharcParameters sharcParameters, SharcRe
     }
 #endif // SHARC_BLEND_ADJACENT_LEVELS
 
+#if SHARC_ENABLE_STANDARD_DEVIATION
     // Every term added above is >= 0; this exists to map a NaN to 0 (DXIL fmax drops the NaN operand) so a
     // single corrupt frame cannot poison the recursion permanently.
-    luminanceM2 = max(luminanceM2, 0.0f);
-    BUFFER_AT_OFFSET(sharcParameters.resolvedBuffer, entryIndex) = SharcPackVoxelData(accumulatedRadiance, accumulatedSampleNum, accumulatedFrameNum, staleFrameNum, luminanceM2);
+    luminance.m2 = max(luminance.m2, 0.0f);
+#endif
+    BUFFER_AT_OFFSET(sharcParameters.resolvedBuffer, entryIndex) = SharcPackVoxelData(accumulatedRadiance, accumulatedSampleNum, accumulatedFrameNum, staleFrameNum, luminance);
 
     // Clear buffer entry for the next frame
     SharcAccumulationData zeroAccumulationData;
