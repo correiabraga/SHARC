@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2023-2025, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2023-2026, NVIDIA CORPORATION. All rights reserved.
  *
  * NVIDIA CORPORATION and its licensors retain all intellectual property
  * and proprietary rights in and to this software, related documentation
@@ -11,16 +11,29 @@
 #ifndef SHARC_TYPES_H
 #define SHARC_TYPES_H
 
+// SharcPackedData uses native float16_t storage. HLSL shaders that include this
+// header must be compiled with DXC -enable-16bit-types and, for DXIL, Shader
+// Model 6.2 or newer. The runtime device must support native 16-bit types.
+
 struct SharcAccumulationData
 {
+#if SHARC_ENABLE_SH_ENCODING
+    int4 data;
+    int4 dataExt;
+#else // !SHARC_ENABLE_SH_ENCODING
     uint4 data;
+#endif // SHARC_ENABLE_SH_ENCODING
 };
 
 struct SharcPackedData
 {
     float16_t4 radianceData;
+#if SHARC_ENABLE_SH_ENCODING
+    uint radianceDataExt;
+    uint sampleNumData;
+#endif // SHARC_ENABLE_SH_ENCODING
     uint sampleData;
-    uint luminanceStats;    // luminance spread statistic (see SHARC_ENABLE_FILTER_MODE): fp32 bits of the EWMA second moment M2, or two fp16 halves - luminance median (low) and MAD of ln luminance (high), or 0 with no filter
+    uint sampleDataExt;     // SHARC_ENABLE_FADE_ACCELERATION's fading bitmask, or the packed luminance statistic of SHARC_ENABLE_FILTER_MODE (SharcCommon.h): fp32 bits of the M2 second moment, or two fp16 halves - median (low) and MAD of ln luminance (high)
 };
 
 #if SHARC_ENABLE_GLSL

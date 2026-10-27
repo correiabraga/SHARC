@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2023-2024, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2023-2026, NVIDIA CORPORATION. All rights reserved.
  *
  * NVIDIA CORPORATION and its licensors retain all intellectual property
  * and proprietary rights in and to this software, related documentation
@@ -42,16 +42,22 @@
 #define lerp mix
 #define rcp(x) (1.0/(x))
 #define saturate(x) clamp(x,0,1)
+#define countbits bitCount
 #define asfloat uintBitsToFloat
 #define asuint floatBitsToUint
 #define f32tof16(f) packHalf2x16(vec2(f, 0))
 #define f16tof32(u) unpackHalf2x16(u).x
 #define InterlockedAdd atomicAdd
-#define InterlockedCompareExchange atomicCompSwap
+#define InterlockedOr atomicOr
+#define InterlockedExchange(destination, value, original) original = atomicExchange(destination, value)
+#define InterlockedCompareExchange(destination, compare, value, original) original = atomicCompSwap(destination, compare, value)
 
+#define HASH_GRID_CONST const
 #define HASH_GRID_LOOP_ATTR [[dont_unroll]]
 
-#define RW_STRUCTURED_BUFFER(name, type) RWStructuredBuffer_##type name
+#define RW_STRUCTURED_BUFFER_I(name, type) RWStructuredBuffer_##type name
+#define RW_STRUCTURED_BUFFER(name, type) RW_STRUCTURED_BUFFER_I(name, type)
+
 #define BUFFER_AT_OFFSET(name, offset) name.data[offset]
 
 layout(buffer_reference, std430, buffer_reference_align = 8) buffer RWStructuredBuffer_uint64_t {
